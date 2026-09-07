@@ -8,6 +8,11 @@ Two can. The second one, with the coefficients it currently ships, would not
 have found the effect the first one measured — and that is the finding worth
 recording, not the plumbing.
 
+Section 5 adds a third data point that is not ours: the one K controller anyone
+has proposed for vLLM that is a policy object rather than a table. It solves the
+calibration problem this note reports failing at, and it is keyed on batch size
+alone.
+
 ---
 
 ## 1. The measured effect is one cell
@@ -150,7 +155,57 @@ how we authored the tiers has not been tested.* Testing it means A/B'ing the
 middle tier, which is one rung on the concurrency ladder already designed in
 `tax_attribution/`.
 
-## 5. What this licenses
+## 5. Prior art: the one proposed policy object is also batch-keyed
+
+PR [#38038](https://github.com/vllm-project/vllm/pull/38038) (`Dynamic SD
+scheduler decides`, opened 2026-03-24, last updated 2026-05-07, still a draft)
+adds `vllm/v1/spec_decode/dynamic/manager.py`. Its
+`DynamicSpeculativeDecodingManager` is the only K controller proposed for vLLM
+that is a policy object rather than an array index, and its docstring states the
+objective directly: *"Computes optimal number of draft tokens based on batch size
+and acceptance rate to maximize goodput = acceptance_length / ITL."*
+
+It is the same shape as the cost model in section 2 — an argmax over K of a
+benefit-over-cost ratio — but it obtains the cost differently:
+
+| | this note's `derive_dynamic_sd_schedule` | #38038's `DynamicSpeculativeDecodingManager` |
+|---|---|---|
+| benefit | `E_accept(K) = sum acceptance^i` | `acceptance_length = 1 + sum(acceptance_rates[:K])` |
+| cost | parametric: `F(ctx) + K * M(bs)` | measured: `batch_stats[bs][K] -> median ITL` |
+| coefficients | hand-set defaults, **shown miscalibrated in section 3** | profiled offline by `generate_config.py` |
+| acceptance | a static prior | refreshed from live `SpecDecodingStats` after a warmup |
+| interpolation | none — tiers are rectangular | linear, over both batch size and K |
+| key | `(batch, ctx)` | `step(batch_size) -> int` |
+
+Two things follow, and they point in opposite directions.
+
+**It validates the functional form and solves the failure this note reports.**
+Section 3 shows our model reproduces A′ rather than C′ because its shipped
+coefficients are wrong by roughly an order of magnitude in the per-context to
+per-batch ratio. #38038 does not have that failure mode, because it does not
+guess the cost — it measures ITL per `(batch_size, K)` and interpolates. That is
+the calibration step our docstring says is required and we have not done.
+
+**It has no context axis at all.** `generate_config.py` sweeps `(batch_size, K)`
+and emits `batch_stats: dict of {batch_size: {num_drafts: median_itl_ms}}`, with
+the request mix coming from whatever dataset the sweep is pointed at. ITL is
+context-dependent; keying the resulting table on batch size alone freezes the
+context distribution of the profiling run into the policy. Searching the full
+diff for `num_computed_tokens` or a context-length term returns nothing — the
+only `seq_lens` occurrences are attention metadata in `eagle.py`, unrelated to
+the K decision.
+
+So the most developed K controller proposed for vLLM — written by a code owner
+(`.github/CODEOWNERS` lists @LucasWilkinson for the attention and flash-attn
+paths), online acceptance-adaptive, goodput-maximising — still cannot express a K
+that depends on context. That is the same observation this note makes about the
+shipped batch-keyed table, in the one place where it would be least expected.
+
+What we have not done: run it. #38038 is an unmerged draft that has been dormant
+since 2026-05-07, and nothing here is a measurement of its behaviour. The claims
+above are read off its source and its companion profiling script.
+
+## 6. What this licenses
 
 - Saying that more than one producer writes into the schedule interface today —
   **yes**, both exist and both are exercised above.
@@ -161,3 +216,6 @@ middle tier, which is one rung on the concurrency ladder already designed in
   matters, and calibration on hardware has not been done.
 - Saying the measured 29–36 % generalises — **no**. It is one model pair, one
   concurrency, four context points, and one differing cell.
+- Saying no policy object for K exists upstream — **no**. #38038 is one, and it
+  predates this note by five months. What can be said is narrower: it is keyed on
+  batch size alone, and it is unmerged and dormant.
